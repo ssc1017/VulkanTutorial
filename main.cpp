@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <optional>  // 物理设备
+#include <set>  // 窗口表面：去重物理设备用于逻辑队列创建
 #include <vulkan/vk_enum_string_helper.h>  // 帮助把VkResult转换成string，string_VkResult
 
 const uint32_t WIDTH = 800;
@@ -51,10 +52,11 @@ void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT
 // 物理设备：保存queuefamily的索引
 // std::optional是一个包装器，它不包含任何值直到为其赋值。调用has_value()成员函数来查询它是否包含值
 struct QueueFamilyIndices {
-    std::optional<uint32_t> graphicsFamily;
+    std::optional<uint32_t> graphicsFamily;  // 图形queue family
+    std::optional<uint32_t> presentFamily;  // 窗口表面：用于展示的queue family，支持物理设备将图像呈现到创建的surface
 
     bool isComplete() {
-        return graphicsFamily.has_value();
+        return graphicsFamily.has_value() && presentFamily.has_value();
     }
 };
 
@@ -72,11 +74,13 @@ private:
 
     VkInstance instance;
     VkDebugUtilsMessengerEXT debugMessenger;  // 验证层：回调message
+    VkSurfaceKHR surface;  // 窗口表面
 
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;  // 物理设备
     VkDevice device;  // 逻辑设备
 
     VkQueue graphicsQueue;  // 逻辑设备：图形队列
+    VkQueue presentQueue;  // 窗口表面：展示队列，用于呈现图像给surface
 
     void initWindow() {
         glfwInit();
@@ -90,6 +94,7 @@ private:
     void initVulkan() {
         createInstance();
         setupDebugMessenger();  // 验证层：创建回调message
+        createSurface();  // 窗口表面：创建完instance之后立刻创建，因为会影响物理设备选择
         pickPhysicalDevice();  // 物理设备
         createLogicalDevice();  // 逻辑设备
     }
@@ -107,6 +112,7 @@ private:
             DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         }
 
+        vkDestroySurfaceKHR(instance, surface, nullptr);
         vkDestroyInstance(instance, nullptr);
 
         glfwDestroyWindow(window);
@@ -185,6 +191,13 @@ private:
         }
     }
 
+    // 窗口表面：创建surface，surface链接了vulkan和window，也就是没有surface vulkan无法渲然到窗口上。glfw函数做了多平台适配
+    void createSurface() {
+        if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create window surface!");
+        }
+    }
+
     // 物理设备：获取物理设备
     void pickPhysicalDevice() {
         uint32_t deviceCount = 0;
@@ -214,14 +227,22 @@ private:
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
 
         // queue的创建信息
-        VkDeviceQueueCreateInfo queueCreateInfo{};
-        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queueCreateInfo.queueFamilyIndex = indices.graphicsFamily.value();
-        queueCreateInfo.queueCount = 1;
+        std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;  // 窗口表面：创建多个queue
+        std::set<uint32_t> uniqueQueueFamilies = {  // 窗口表面：使用set去重，如果物理设备是同一个则只保留一个
+            indices.graphicsFamily.value(),
+            indices.presentFamily.value()
+        };
 
         // 0.0到1.0分配队列优先级来影响Command Buffer执行的调用，即使只有一个queue也是必须的
         float queuePriority = 1.0f;
-        queueCreateInfo.pQueuePriorities = &queuePriority;
+        for (uint32_t queueFamily : uniqueQueueFamilies) {
+            VkDeviceQueueCreateInfo queueCreateInfo{};
+            queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queueCreateInfo.queueFamilyIndex = queueFamily;
+            queueCreateInfo.queueCount = 1;
+            queueCreateInfo.pQueuePriorities = &queuePriority;
+            queueCreateInfos.push_back(queueCreateInfo);
+        }
 
         VkPhysicalDeviceFeatures deviceFeatures{};
 
@@ -229,8 +250,8 @@ private:
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
-        createInfo.pQueueCreateInfos = &queueCreateInfo;
-        createInfo.queueCreateInfoCount = 1;
+        createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+        createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
         createInfo.pEnabledFeatures = &deviceFeatures;
 
@@ -254,8 +275,9 @@ private:
             throw std::runtime_error("failed to create logical device!");
         }
 
-        // 创建queue，queuefamily中只有一个队列所以索引是0
+        // 创建queue
         vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
+        vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);  // 窗口表面：创建queue
     }
 
     bool isDeviceSuitable(VkPhysicalDevice device) {
@@ -278,6 +300,14 @@ private:
         for (const auto& queueFamily : queueFamilies) {
             if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {  // 检查queuefamily是否支持图形功能
                 indices.graphicsFamily = i;
+            }
+
+            // 窗口表面：检查queuefamily是否支持呈现功能
+            VkBool32 presentSupport = false;
+            vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &presentSupport);
+
+            if (presentSupport) {
+                indices.presentFamily = i;
             }
 
             if (indices.isComplete()) {
