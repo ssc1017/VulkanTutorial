@@ -17,6 +17,13 @@ const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
 
+// 逻辑设备：在mac上的vulkan运行时必须开启该extension
+#ifdef __APPLE__
+const std::vector<const char*> deviceExtensions = {
+    "VK_KHR_portability_subset"
+};
+#endif
+
 #ifdef NDEBUG  // C的宏，assert中也用到这个
 const bool enableValidationLayers = false;
 #else
@@ -67,6 +74,9 @@ private:
     VkDebugUtilsMessengerEXT debugMessenger;  // 验证层：回调message
 
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;  // 物理设备
+    VkDevice device;  // 逻辑设备
+
+    VkQueue graphicsQueue;  // 逻辑设备：图形队列
 
     void initWindow() {
         glfwInit();
@@ -81,6 +91,7 @@ private:
         createInstance();
         setupDebugMessenger();  // 验证层：创建回调message
         pickPhysicalDevice();  // 物理设备
+        createLogicalDevice();  // 逻辑设备
     }
 
     void mainLoop() {
@@ -90,6 +101,8 @@ private:
     }
 
     void cleanup() {
+        vkDestroyDevice(device, nullptr);
+
         if (enableValidationLayers) {
             DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         }
@@ -113,7 +126,7 @@ private:
         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.pEngineName = "No Engine";  // 不使用特定引擎，可以写上自己引擎的名字
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.apiVersion = VK_API_VERSION_1_0;  // vulkan版本
+        appInfo.apiVersion = VK_API_VERSION_1_3;  // vulkan版本，这里不能使用1.0否则会要求扩展VK_KHR_get_physical_device_properties2
 
         VkInstanceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -194,6 +207,55 @@ private:
         if (physicalDevice == VK_NULL_HANDLE) {
             throw std::runtime_error("failed to find a suitable GPU!");
         }
+    }
+
+    // 逻辑设备：创建逻辑设备
+    void createLogicalDevice() {
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+
+        // queue的创建信息
+        VkDeviceQueueCreateInfo queueCreateInfo{};
+        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfo.queueFamilyIndex = indices.graphicsFamily.value();
+        queueCreateInfo.queueCount = 1;
+
+        // 0.0到1.0分配队列优先级来影响Command Buffer执行的调用，即使只有一个queue也是必须的
+        float queuePriority = 1.0f;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+
+        VkPhysicalDeviceFeatures deviceFeatures{};
+
+        // device的创建信息
+        VkDeviceCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+
+        createInfo.pQueueCreateInfos = &queueCreateInfo;
+        createInfo.queueCreateInfoCount = 1;
+
+        createInfo.pEnabledFeatures = &deviceFeatures;
+
+#ifdef __APPLE__
+        createInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
+        createInfo.ppEnabledExtensionNames = deviceExtensions.data();
+#else
+        createInfo.enabledExtensionCount = 0;
+#endif
+
+        // 之前device和instance的validation layer设置是分开的，但是现在基本只用instance，这里是为了兼容
+        if (enableValidationLayers) {
+            createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
+            createInfo.ppEnabledLayerNames = validationLayers.data();
+        } else {
+            createInfo.enabledLayerCount = 0;
+        }
+
+        // 创建device，这里不需要instance参与创建
+        if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create logical device!");
+        }
+
+        // 创建queue，queuefamily中只有一个队列所以索引是0
+        vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
     }
 
     bool isDeviceSuitable(VkPhysicalDevice device) {
