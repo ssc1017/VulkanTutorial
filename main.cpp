@@ -100,6 +100,7 @@ private:
     std::vector<VkImage> swapChainImages;
     VkFormat swapChainImageFormat;
     VkExtent2D swapChainExtent;
+    std::vector<VkImageView> swapChainImageViews;  // imageview：需要用view来读取swapchain image
 
     void initWindow() {
         glfwInit();
@@ -117,6 +118,7 @@ private:
         pickPhysicalDevice();  // 物理设备
         createLogicalDevice();  // 逻辑设备
         createSwapChain();  // swapchain
+        createImageViews();  // imageview
     }
 
     void mainLoop() {
@@ -126,6 +128,10 @@ private:
     }
 
     void cleanup() {
+        for (auto imageView : swapChainImageViews) {
+            vkDestroyImageView(device, imageView, nullptr);
+        }
+
         vkDestroySwapchainKHR(device, swapChain, nullptr);
         vkDestroyDevice(device, nullptr);
 
@@ -356,6 +362,35 @@ private:
         // 保留image格式和分辨率
         swapChainImageFormat = surfaceFormat.format;
         swapChainExtent = extent;
+    }
+
+    // imageview: view描述了如何访问图像以及哪一部分，这里为每个swapchain image创建view，创建后图像可作为color target
+    void createImageViews() {
+        swapChainImageViews.resize(swapChainImages.size());
+
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            VkImageViewCreateInfo createInfo{};
+            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            createInfo.image = swapChainImages[i];
+            // type和format描述了如何解释图像数据
+            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            createInfo.format = swapChainImageFormat;
+            // 允许调整通道，比如可以都映射到r通道形成单色纹理
+            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+            // subresourcerange描述如何使用图像以及哪一部分，这里用作color target
+            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            createInfo.subresourceRange.baseMipLevel = 0;
+            createInfo.subresourceRange.levelCount = 1;
+            createInfo.subresourceRange.baseArrayLayer = 0;
+            createInfo.subresourceRange.layerCount = 1;
+
+            if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create image views!");
+            }
+        }
     }
 
     // swapchain：寻找最佳surface配置
