@@ -119,6 +119,7 @@ private:
         createLogicalDevice();  // 逻辑设备
         createSwapChain();  // swapchain
         createImageViews();  // imageview
+        createGraphicsPipeline();  // pipeline
     }
 
     void mainLoop() {
@@ -391,6 +392,11 @@ private:
                 throw std::runtime_error("failed to create image views!");
             }
         }
+    }
+
+    // pipeline：创建pipeline
+    void createGraphicsPipeline() {
+
     }
 
     // swapchain：寻找最佳surface配置
