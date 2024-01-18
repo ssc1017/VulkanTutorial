@@ -2,6 +2,7 @@
 #include <GLFW/glfw3.h>
 
 #include <iostream>
+#include <fstream>  // shader module：读取文件
 #include <stdexcept>
 #include <vector>
 #include <cstring>
@@ -396,7 +397,44 @@ private:
 
     // pipeline：创建pipeline
     void createGraphicsPipeline() {
+        auto vertShaderCode = readFile("/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/shaders/vert.spv");
+        auto fragShaderCode = readFile("/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/shaders/frag.spv");
+        
+        // shader module在pipeline创建之后可以被销毁，因为创建管道时被编译和链接到机器码
+        VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
+        VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
 
+        VkPipelineShaderStageCreateInfo vertShaderStageInfo{};
+        vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        vertShaderStageInfo.module = vertShaderModule;
+        vertShaderStageInfo.pName = "main";  // 指定调用函数，这意味着可以将多个shader组合在一个shader module中并用不同入口点区分
+
+        VkPipelineShaderStageCreateInfo fragShaderStageInfo{};
+        fragShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragShaderStageInfo.module = fragShaderModule;
+        fragShaderStageInfo.pName = "main";
+
+        VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+
+        vkDestroyShaderModule(device, fragShaderModule, nullptr);
+        vkDestroyShaderModule(device, vertShaderModule, nullptr);
+    }
+
+    // shader module：把shader代码包装进VkShaderModule
+    VkShaderModule createShaderModule(const std::vector<char>& code) {
+        VkShaderModuleCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        createInfo.codeSize = code.size();
+        createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());  // 字节码指针式uint32_t所以要转换
+
+        VkShaderModule shaderModule;
+        if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create shader module!");
+        }
+
+        return shaderModule;
     }
 
     // swapchain：寻找最佳surface配置
@@ -590,6 +628,27 @@ private:
         }
 
         return true;
+    }
+
+    // shader module：读取spriv文件
+    static std::vector<char> readFile(const std::string& filename) {
+        // ate：从文件末端读取，好处是可以使用读取位置确定文件大小并分配缓冲
+        // binary：作为二进制读取，避免文本转换
+        std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+        if (!file.is_open()) {
+            throw std::runtime_error("failed to open file!");
+        }
+
+        size_t fileSize = (size_t) file.tellg();  // tellg返回当前指针位置，因为ate所以返回了文件大小
+        std::vector<char> buffer(fileSize);
+
+        file.seekg(0);  // 从0开始读取
+        file.read(buffer.data(), fileSize);
+
+        file.close();
+
+        return buffer;
     }
 
     // 验证层：VKAPI_ATTR和VKAPI_CALL用于确保函数具有正确签名，让vulkan能正确调用
