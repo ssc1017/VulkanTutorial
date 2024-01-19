@@ -103,6 +103,8 @@ private:
     VkExtent2D swapChainExtent;
     std::vector<VkImageView> swapChainImageViews;  // imageview：需要用view来读取swapchain image
 
+    VkPipelineLayout pipelineLayout;  // fixed function：用于传递uniform
+
     void initWindow() {
         glfwInit();
 
@@ -130,6 +132,8 @@ private:
     }
 
     void cleanup() {
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+
         for (auto imageView : swapChainImageViews) {
             vkDestroyImageView(device, imageView, nullptr);
         }
@@ -417,6 +421,79 @@ private:
         fragShaderStageInfo.pName = "main";
 
         VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+        
+        // fixed function：描述顶点数据格式
+        VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInputInfo.vertexBindingDescriptionCount = 0;  // 主要描述数据之间的间距以及数据是逐顶点还是逐实例
+        vertexInputInfo.vertexAttributeDescriptionCount = 0;  // 传递给顶点着色器的属性的类型，从哪个bind加载它们以及在哪个偏移量
+
+        // fixed function：决定图元类型以及是否开启图元复用
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+        // fixed function：设置viewport和scissor，viewport和window分辨率一样，定义图像到framebuffer转换，scissor定义实际存储区域
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        // fixed function：设置光栅化器
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.depthClampEnable = VK_FALSE;  // 如果是ture则远近平面片段会被截断到深度范围而不是直接丢弃
+        rasterizer.rasterizerDiscardEnable = VK_FALSE;  // 如果为ture则图形不会通过光栅化，不会有输出
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;  // 确定如何生成片段，比如可以选择输出线框或者输出顶点
+        rasterizer.lineWidth = 1.0f;  // 线条粗细
+        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;  // 面剔除，这里剔除背面
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;  // 视为正面的顶点顺序，这里顺时针
+        rasterizer.depthBiasEnable = VK_FALSE;  // 主要是用于shadow map的深度偏移，可以添加常值或者片段斜率作为偏移量
+
+        // fixed function：硬件抗锯齿
+        VkPipelineMultisampleStateCreateInfo multisampling{};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.sampleShadingEnable = VK_FALSE;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        // fixed function：片段着色器返回需要与framebuffer混合，这里进行设置
+        VkPipelineColorBlendAttachmentState colorBlendAttachment{};  // 每个attachment的混合设置
+        // 控制blend后颜色写入通道，这里开启rgba
+        colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        colorBlendAttachment.blendEnable = VK_FALSE;  // 是否开启blend
+
+        VkPipelineColorBlendStateCreateInfo colorBlending{};  // 全局混合设置，开启后将禁用上面的设置
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.logicOp = VK_LOGIC_OP_COPY;
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAttachment;
+        colorBlending.blendConstants[0] = 0.0f;
+        colorBlending.blendConstants[1] = 0.0f;
+        colorBlending.blendConstants[2] = 0.0f;
+        colorBlending.blendConstants[3] = 0.0f;
+
+
+        // fixed function：大部分管道状态需要预编译进PSO中，而有些dynamic state可以直接更改而不需要重现创建管道
+        std::vector<VkDynamicState> dynamicStates = {  // viewport和scissor设置成动态状态
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR
+        };
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        // fixed function：shader中的uniform需要pipelinelayout来指定
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 0;
+        pipelineLayoutInfo.pushConstantRangeCount = 0;  // 指定了pushConstant，也是传递uniform的方式
+
+        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create pipeline layout!");
+        }
 
         vkDestroyShaderModule(device, fragShaderModule, nullptr);
         vkDestroyShaderModule(device, vertShaderModule, nullptr);
