@@ -103,6 +103,7 @@ private:
     VkExtent2D swapChainExtent;
     std::vector<VkImageView> swapChainImageViews;  // imageview：需要用view来读取swapchain image
 
+    VkRenderPass renderPass;  // renderpass
     VkPipelineLayout pipelineLayout;  // fixed function：用于传递uniform
 
     void initWindow() {
@@ -122,6 +123,7 @@ private:
         createLogicalDevice();  // 逻辑设备
         createSwapChain();  // swapchain
         createImageViews();  // imageview
+        createRenderPass();  // renderpass
         createGraphicsPipeline();  // pipeline
     }
 
@@ -133,6 +135,7 @@ private:
 
     void cleanup() {
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        vkDestroyRenderPass(device, renderPass, nullptr);
 
         for (auto imageView : swapChainImageViews) {
             vkDestroyImageView(device, imageView, nullptr);
@@ -396,6 +399,43 @@ private:
             if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
                 throw std::runtime_error("failed to create image views!");
             }
+        }
+    }
+
+    // renderpass：在pipeline之前创建
+    void createRenderPass() {
+        // attachment
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = swapChainImageFormat;  // 与swapchain image一致
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;  // 没有开启抗锯齿所以是1
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // 渲染前处理attachment，适用于color和depth。这里做清除
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;  // 渲染后处理attachment，适用于color和depth。这里将内容存储在内存中
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // 适用于stencil
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;  // 适用于stencil
+        // layout问题：cpu往往线性读写图像，而gpu适合tile的方式读写图像，需要不同布局
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // 指定渲染前图像的布局。这里是不关心布局，也意味着图像会被清除
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;  // 指定renderpass完成后转换的布局，这里是在swapchain用于展示
+
+        // subpass：一个subpass依赖于先前subpass渲染结果，比如用于处理一系列后处理效果
+        VkAttachmentReference colorAttachmentRef{};  // 用于subpass引用一个或多个attachment
+        colorAttachmentRef.attachment = 0;  // 索引，这里是指fs中layout(location = 0) out vec4
+        colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;  // vulkan未来可能支持compute subpass所以和graphics区分
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorAttachmentRef;  // fs结果写入这个attachment
+
+        // renderpass
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create render pass!");
         }
     }
 
