@@ -105,6 +105,7 @@ private:
 
     VkRenderPass renderPass;  // renderpass
     VkPipelineLayout pipelineLayout;  // fixed function：用于传递uniform
+    VkPipeline graphicsPipeline;  // pipeline
 
     void initWindow() {
         glfwInit();
@@ -134,6 +135,7 @@ private:
     }
 
     void cleanup() {
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
 
@@ -533,6 +535,32 @@ private:
 
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create pipeline layout!");
+        }
+
+        // pipeline：创建pipeline，综合之前的设置
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        // 设置shader stage
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = shaderStages;
+        // 设置fixed function
+        pipelineInfo.pVertexInputState = &vertexInputInfo;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.pDynamicState = &dynamicState;
+        // 设置pipeline layout
+        pipelineInfo.layout = pipelineLayout;
+        // 设置render pass
+        pipelineInfo.renderPass = renderPass;
+        pipelineInfo.subpass = 0;
+        // 管道派生，如果管道与现有管道有很多共同功能则创建成本更低，并且同一父管道的子管道间切换更快。这里可以设置现有管道句柄
+        pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
+
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create graphics pipeline!");
         }
 
         vkDestroyShaderModule(device, fragShaderModule, nullptr);
