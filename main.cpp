@@ -102,6 +102,7 @@ private:
     VkFormat swapChainImageFormat;
     VkExtent2D swapChainExtent;
     std::vector<VkImageView> swapChainImageViews;  // imageview：需要用view来读取swapchain image
+    std::vector<VkFramebuffer> swapChainFramebuffers;  // framebuffer
 
     VkRenderPass renderPass;  // renderpass
     VkPipelineLayout pipelineLayout;  // fixed function：用于传递uniform
@@ -126,6 +127,7 @@ private:
         createImageViews();  // imageview
         createRenderPass();  // renderpass
         createGraphicsPipeline();  // pipeline
+        createFramebuffers();  // framebuffer
     }
 
     void mainLoop() {
@@ -135,6 +137,10 @@ private:
     }
 
     void cleanup() {
+        for (auto framebuffer : swapChainFramebuffers) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
+
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
@@ -565,6 +571,31 @@ private:
 
         vkDestroyShaderModule(device, fragShaderModule, nullptr);
         vkDestroyShaderModule(device, vertShaderModule, nullptr);
+    }
+
+    // framebuffer：renderpass创建时声明的attachment还需要通过framebuffer进行绑定，renderpass指定了格式而实际资源在framebuffer中
+    // 这里用到了一个color attachment，但是需要不止一个framebuffer因为要对每个swap chain的image创建framebuffer并在绘制时使用对应的framebuffer
+    void createFramebuffers() {
+        swapChainFramebuffers.resize(swapChainImageViews.size());
+
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+            VkImageView attachments[] = {
+                swapChainImageViews[i]
+            };
+
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = renderPass;  // 指定framebuffer兼容的renderpass，大致意味着需要使用相同数量和类型的附件
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = attachments;  // 指定imageview会被绑定到attachment中
+            framebufferInfo.width = swapChainExtent.width;
+            framebufferInfo.height = swapChainExtent.height;
+            framebufferInfo.layers = 1;
+
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &swapChainFramebuffers[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create framebuffer!");
+            }
+        }
     }
 
     // shader module：把shader代码包装进VkShaderModule
