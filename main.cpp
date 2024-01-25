@@ -108,6 +108,9 @@ private:
     VkPipelineLayout pipelineLayout;  // fixed function：用于传递uniform
     VkPipeline graphicsPipeline;  // pipeline
 
+    VkCommandPool commandPool;  // command buffer：命令池
+    VkCommandBuffer commandBuffer;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
+
     void initWindow() {
         glfwInit();
 
@@ -128,6 +131,8 @@ private:
         createRenderPass();  // renderpass
         createGraphicsPipeline();  // pipeline
         createFramebuffers();  // framebuffer
+        createCommandPool();  // command buffer
+        createCommandBuffer();  // command buffer
     }
 
     void mainLoop() {
@@ -137,6 +142,8 @@ private:
     }
 
     void cleanup() {
+        vkDestroyCommandPool(device, commandPool, nullptr);
+
         for (auto framebuffer : swapChainFramebuffers) {
             vkDestroyFramebuffer(device, framebuffer, nullptr);
         }
@@ -595,6 +602,95 @@ private:
             if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &swapChainFramebuffers[i]) != VK_SUCCESS) {
                 throw std::runtime_error("failed to create framebuffer!");
             }
+        }
+    }
+
+    // command buffer：分配command buffer
+    void createCommandPool() {
+        QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
+
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        // 有两种flag
+        // VK_COMMAND_POOL_CREATE_TRANSIENT_BIT：提示command buffer会频繁重新记录新命令，可能会改变内存分配行为
+        // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT：允许command buffer被单独重新记录而不需要全部command buffer被重置
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();  // 每个pool只能分配单一类型队列上提交的command buffer，因为要记录绘图命令所以选择图形队列
+
+        if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create command pool!");
+        }
+    }
+
+    // command buffer：创建command buffer
+    void createCommandBuffer() {
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;  // 指定command pool
+        // 指定分配command buffer的主从关系
+        // VK_COMMAND_BUFFER_LEVEL_PRIMARY：可以提交到队列执行，但不能从其它command buffer中被调用
+        // VK_COMMAND_BUFFER_LEVEL_SECONDARY：不能提交，但可以被primary command buffer调用。对于复用常用操作有帮助
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+
+        if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate command buffers!");
+        }
+    }
+
+    // command buffer：记录command，将command和swapchain image索引作为参数传入
+    void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+        if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+            throw std::runtime_error("failed to begin recording command buffer!");
+        }
+
+        // 启动render pass
+        VkRenderPassBeginInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = renderPass;
+        renderPassInfo.framebuffer = swapChainFramebuffers[imageIndex];
+        renderPassInfo.renderArea.offset = {0, 0};  // 指定渲染区域大小。定义着色器加载和存储的位置
+        renderPassInfo.renderArea.extent = swapChainExtent;  // 指定渲染区域大小
+
+        VkClearValue clearColor = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearColor;  // 定义了VK_ATTACHMENT_LOAD_OP_CLEAR的清除值，用于颜色附件加载操作
+
+        // 所有命令函数都是vkCmd前缀，返回都是void所以记录结束前不能错误处理
+        // VK_SUBPASS_CONTENTS_INLINE：render pass命令被嵌入在primary command buffer中
+        // VK_SUBPASS_CONTENTS_SECONDARY_COOMAND_BUFFERS：render pass命令从secondary command buffer中执行
+        vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);  // 第二个参数指定图形还是计算管道
+
+            // pipeline指定了动态属性，这里进行设置
+            VkViewport viewport{};
+            viewport.x = 0.0f;
+            viewport.y = 0.0f;
+            viewport.width = (float) swapChainExtent.width;
+            viewport.height = (float) swapChainExtent.height;
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+            VkRect2D scissor{};
+            scissor.offset = {0, 0};
+            scissor.extent = swapChainExtent;
+            vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+            // vertexCount：顶点数量。即使不设置顶点缓冲区也需要设置
+            // instanceCount：用于实例化渲染
+            // firstVertex：顶点缓冲区的偏移量，定义gl_VertexIndex最小值
+            // firstInstance：实例化的偏移量，定义gl_InstanceIndex最小值
+            vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(commandBuffer);
+
+        if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to record command buffer!");
         }
     }
 
