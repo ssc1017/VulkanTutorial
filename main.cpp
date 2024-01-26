@@ -111,6 +111,11 @@ private:
     VkCommandPool commandPool;  // command buffer：命令池
     VkCommandBuffer commandBuffer;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
 
+    // rendering：同步原语
+    VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderFinishedSemaphore;
+    VkFence inFlightFence;
+
     void initWindow() {
         glfwInit();
 
@@ -133,15 +138,23 @@ private:
         createFramebuffers();  // framebuffer
         createCommandPool();  // command buffer
         createCommandBuffer();  // command buffer
+        createSyncObjects();  // rendering
     }
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();  // 事件循环处理
+            drawFrame();  // rendering
         }
+
+        vkDeviceWaitIdle(device);  // rendering：mainloop退出时因为drawFrame中操作是异步的原因可能draw和present依然在进行，需要等待逻辑设备完成操作后才清理资源
     }
 
     void cleanup() {
+        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
+        vkDestroyFence(device, inFlightFence, nullptr);
+
         vkDestroyCommandPool(device, commandPool, nullptr);
 
         for (auto framebuffer : swapChainFramebuffers) {
@@ -441,6 +454,20 @@ private:
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorAttachmentRef;  // fs结果写入这个attachment
 
+        // rendering：设置subpass依赖关系，用于自动处理图像布局转换
+        // 现在有一个subpass但是这之前和之后的操作算作隐式subpass
+        // 这两个内置依赖项在renderpass开始和结束时处理过渡，但开始依赖项假设过渡在管道开始时发生，但在管道开始时可能还没有获取到图像
+        // 没有获取到图像是因为imageAvailableSemaphore是阻塞在attachment写入阶段
+        // 解决方法一种是更改imageAvailableSemaphore成VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT阶段等待
+        // 另一种办法是renderpass等待VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT阶段，也就是这里的方式
+        VkSubpassDependency dependency{};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;  // VK_SUBPASS_EXTERNAL指renderpass之前或之后的隐藏subpass，取决于在src还是dst中指定，这里是src所以是指之前
+        dependency.dstSubpass = 0;  // 0是我们定义的subpass索引。dst必须高于src避免依赖循环，除非其中之一是VK_SUBPASS_EXTERNAL
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;  // 指定等待的阶段，也就是swap chain获取到可用图像后然后发送信号后才能访问这个subpass
+        dependency.srcAccessMask = 0;  // 指定等待的操作
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;  // 在这个阶段等待
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;  // 需要颜色写入时并且在阶段内进行等待
+
         // renderpass
         VkRenderPassCreateInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -448,6 +475,9 @@ private:
         renderPassInfo.pAttachments = &colorAttachment;
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
+        // rendering：设置subpass dependency
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
 
         if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
             throw std::runtime_error("failed to create render pass!");
@@ -693,6 +723,86 @@ private:
             throw std::runtime_error("failed to record command buffer!");
         }
     }
+
+    // rendering：创建同步对象。因为许多vulkan api调用是异步的，在操作完成前就返回了
+    // semaphore：用于控制同队列或不同队列之间的队列操作顺序，队列操作指提交给队列的工作
+    // 有binary和timeline两种类型semaphore。这里queue分别是graphics和presentation queue，只用binary semaphore
+    // semaphore造成的等待只会发生在gpu上，cpu需要fence
+    // fence：控制cpu上执行顺序，如果host需要知道gpu完成了什么就需要用fence。一般避免fence
+    void createSyncObjects() {
+        VkSemaphoreCreateInfo semaphoreInfo{};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;  // 这个标志是在已经发出了信号的情况才创建fence，用于避免第一帧在没有上一帧发出信号的情况下被阻塞
+
+        // 第一个semaphore用于swap chain获取图像准备渲染
+        // 第二个semaphore用于表示渲染完成可以进行present
+        // fence用于等待前一帧，避免cpu覆盖了gpu还在用的command buffer
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
+            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS ||
+            vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create synchronization objects for a frame!");
+        }
+
+    }
+
+    // rendering
+    void drawFrame() {
+        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);  // 绘制开始前等待上一帧结束，这样command buffer和semaphor可用。避免第一帧被阻塞需要设置VK_FENCE_CREATE_SIGNALED_BIT
+        vkResetFences(device, 1, &inFlightFence);  // 手动重置fence为无信号
+
+        // 从swap chain取图像
+        // semaphore是完成使用图像时发出的同步对象，是可以开始绘制的时间点。这里也可以使用fence来同步，但现在只用semaphore
+        // imageIndex输出可用的swap chain image索引，使用该索引来选择VkFrameBuffer
+        uint32_t imageIndex;
+        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        // 记录command buffer
+        vkResetCommandBuffer(commandBuffer, /*VkCommandBufferResetFlagBits*/ 0);
+        recordCommandBuffer(commandBuffer, imageIndex);
+
+        // 配置队列提交和同步
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};  // 指定等待semaphore
+        // 注意如果是写入attachment阶段阻塞，那么和srcSubpass默认设置有冲突，如果不改默认设置则这里要改成VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+        VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};  // 指定等待阶段，这里是写入颜色附件阶段。获得新的image再写入
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = waitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        // 指定command buffer完成后发出的信号
+        VkSemaphore signalSemaphores[] = {renderFinishedSemaphore};
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = signalSemaphores;
+
+        // 提交到队列，fence会在执行完成后发出信号，这里保证安全重用command buffer
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("failed to submit draw command buffer!");
+        }
+
+        // presentation，渲染完成后将结果提交回swap chain并present上屏幕
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = signalSemaphores;  // 等待的信号量，这里等待command buffer完成
+
+        VkSwapchainKHR swapChains[] = {swapChain};
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = swapChains;  // 指定图像传输的swap chain
+
+        presentInfo.pImageIndices = &imageIndex;  // 传输的swap chain image索引
+
+        vkQueuePresentKHR(presentQueue, &presentInfo);  // 向swapchain提交present图像请求
+    }
+
 
     // shader module：把shader代码包装进VkShaderModule
     VkShaderModule createShaderModule(const std::vector<char>& code) {
