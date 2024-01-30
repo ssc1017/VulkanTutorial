@@ -14,6 +14,12 @@
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
 
+// frames in flight：fence等待前一帧完成cpu才能继续执行，这样cpu占用降低
+// 解决方法是允许多个帧同时进行录制command buffer
+// 定义同时处理的帧数量为2，也就是cpu录制这一帧给gpu渲染后然后立刻录制下一帧，如果下一帧录制提交给gpu结束后再准备录制这一帧发现这一帧gpu渲染没结束才阻塞
+// 定义成2时因为如果有更多帧同时录制可能造成帧延迟，也就是gpu当前渲染出来的几帧前的cpu数据
+const int MAX_FRAMES_IN_FLIGHT = 2;
+
 // 验证层扩展名
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -109,12 +115,14 @@ private:
     VkPipeline graphicsPipeline;  // pipeline
 
     VkCommandPool commandPool;  // command buffer：命令池
-    VkCommandBuffer commandBuffer;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
+    // frames in flight：command buffer和同步对象对每个帧都创建一个，全改成vector
+    std::vector<VkCommandBuffer>  commandBuffers;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
 
     // rendering：同步原语
-    VkSemaphore imageAvailableSemaphore;
-    VkSemaphore renderFinishedSemaphore;
-    VkFence inFlightFence;
+    std::vector<VkSemaphore> imageAvailableSemaphores;
+    std::vector<VkSemaphore> renderFinishedSemaphores;
+    std::vector<VkFence> inFlightFences;
+    uint32_t currentFrame = 0;
 
     void initWindow() {
         glfwInit();
@@ -151,9 +159,11 @@ private:
     }
 
     void cleanup() {
-        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
-        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
-        vkDestroyFence(device, inFlightFence, nullptr);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
+            vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
+            vkDestroyFence(device, inFlightFences[i], nullptr);
+        }
 
         vkDestroyCommandPool(device, commandPool, nullptr);
 
@@ -654,6 +664,8 @@ private:
 
     // command buffer：创建command buffer
     void createCommandBuffer() {
+        commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);  // frames in flight：每个帧创建一个command buffer
+
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.commandPool = commandPool;  // 指定command pool
@@ -661,9 +673,9 @@ private:
         // VK_COMMAND_BUFFER_LEVEL_PRIMARY：可以提交到队列执行，但不能从其它command buffer中被调用
         // VK_COMMAND_BUFFER_LEVEL_SECONDARY：不能提交，但可以被primary command buffer调用。对于复用常用操作有帮助
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
+        allocInfo.commandBufferCount = (uint32_t) commandBuffers.size();
 
-        if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+        if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate command buffers!");
         }
     }
@@ -730,6 +742,11 @@ private:
     // semaphore造成的等待只会发生在gpu上，cpu需要fence
     // fence：控制cpu上执行顺序，如果host需要知道gpu完成了什么就需要用fence。一般避免fence
     void createSyncObjects() {
+        // frames in flight：每帧创建同步对象
+        imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -740,34 +757,36 @@ private:
         // 第一个semaphore用于swap chain获取图像准备渲染
         // 第二个semaphore用于表示渲染完成可以进行present
         // fence用于等待前一帧，避免cpu覆盖了gpu还在用的command buffer
-        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
-            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS ||
-            vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create synchronization objects for a frame!");
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
+                vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
+                vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create synchronization objects for a frame!");
+            }
         }
 
     }
 
     // rendering
     void drawFrame() {
-        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);  // 绘制开始前等待上一帧结束，这样command buffer和semaphor可用。避免第一帧被阻塞需要设置VK_FENCE_CREATE_SIGNALED_BIT
-        vkResetFences(device, 1, &inFlightFence);  // 手动重置fence为无信号
+        vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);  // 绘制开始前等待上一帧结束，这样command buffer和semaphor可用。避免第一帧被阻塞需要设置VK_FENCE_CREATE_SIGNALED_BIT
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);  // 手动重置fence为无信号
 
         // 从swap chain取图像
         // semaphore是完成使用图像时发出的同步对象，是可以开始绘制的时间点。这里也可以使用fence来同步，但现在只用semaphore
         // imageIndex输出可用的swap chain image索引，使用该索引来选择VkFrameBuffer
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
 
         // 记录command buffer
-        vkResetCommandBuffer(commandBuffer, /*VkCommandBufferResetFlagBits*/ 0);
-        recordCommandBuffer(commandBuffer, imageIndex);
+        vkResetCommandBuffer(commandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
+        recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
         // 配置队列提交和同步
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};  // 指定等待semaphore
+        VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};  // 指定等待semaphore
         // 注意如果是写入attachment阶段阻塞，那么和srcSubpass默认设置有冲突，如果不改默认设置则这里要改成VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
         VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};  // 指定等待阶段，这里是写入颜色附件阶段。获得新的image再写入
         submitInfo.waitSemaphoreCount = 1;
@@ -775,15 +794,15 @@ private:
         submitInfo.pWaitDstStageMask = waitStages;
 
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
+        submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
 
         // 指定command buffer完成后发出的信号
-        VkSemaphore signalSemaphores[] = {renderFinishedSemaphore};
+        VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrame]};
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSemaphores;
 
         // 提交到队列，fence会在执行完成后发出信号，这里保证安全重用command buffer
-        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS) {
             throw std::runtime_error("failed to submit draw command buffer!");
         }
 
@@ -801,6 +820,8 @@ private:
         presentInfo.pImageIndices = &imageIndex;  // 传输的swap chain image索引
 
         vkQueuePresentKHR(presentQueue, &presentInfo);  // 向swapchain提交present图像请求
+
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;  // frames in flight：切换资源
     }
 
 
