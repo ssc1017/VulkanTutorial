@@ -124,13 +124,26 @@ private:
     std::vector<VkFence> inFlightFences;
     uint32_t currentFrame = 0;
 
+    bool framebufferResized = false;  // swap chain recreation：标记是否发生调整window大小的操作
+
     void initWindow() {
         glfwInit();
 
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+        
+        // swap chain recreation：设置window大小改变回调处理
+        glfwSetWindowUserPointer(window, this);  // 存储this指针
+        glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    }
+
+    // swap chain recreation：回调函数，在window大小变化时处理
+    // 使用静态函数是因为glfw不知道this类型的成员函数是什么，但是可以通过glfwSetWindowUserPointer获取到this指针
+    static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));  // 取出this指针
+        app->framebufferResized = true;
     }
 
     void initVulkan() {
@@ -158,7 +171,27 @@ private:
         vkDeviceWaitIdle(device);  // rendering：mainloop退出时因为drawFrame中操作是异步的原因可能draw和present依然在进行，需要等待逻辑设备完成操作后才清理资源
     }
 
+    // swap chain recreation：单独提取出swap chain清理方便重建时调用
+    void cleanupSwapChain() {
+        for (auto framebuffer : swapChainFramebuffers) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
+
+        for (auto imageView : swapChainImageViews) {
+            vkDestroyImageView(device, imageView, nullptr);
+        }
+
+        vkDestroySwapchainKHR(device, swapChain, nullptr);
+    }
+
     void cleanup() {
+        cleanupSwapChain();
+
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+
+        vkDestroyRenderPass(device, renderPass, nullptr);
+
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
             vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
@@ -167,19 +200,6 @@ private:
 
         vkDestroyCommandPool(device, commandPool, nullptr);
 
-        for (auto framebuffer : swapChainFramebuffers) {
-            vkDestroyFramebuffer(device, framebuffer, nullptr);
-        }
-
-        vkDestroyPipeline(device, graphicsPipeline, nullptr);
-        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-        vkDestroyRenderPass(device, renderPass, nullptr);
-
-        for (auto imageView : swapChainImageViews) {
-            vkDestroyImageView(device, imageView, nullptr);
-        }
-
-        vkDestroySwapchainKHR(device, swapChain, nullptr);
         vkDestroyDevice(device, nullptr);
 
         if (enableValidationLayers) {
@@ -192,6 +212,25 @@ private:
         glfwDestroyWindow(window);
 
         glfwTerminate();
+    }
+    
+    // swap chain recreation：window surface变化导致swap chain不兼容需要重新创建，比如window大小改变
+    // 这里不会重建renderpass，理论上swap chain format可能在应用程序生命周期中变化，比如从sdr变成hdr，就需要重建renderpass
+    void recreateSwapChain() {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        while (width == 0 || height == 0) {  // 如果window最小化则暂停glfw处理，直到程序到前台再重建swap chain
+            glfwGetFramebufferSize(window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        vkDeviceWaitIdle(device);
+
+        cleanupSwapChain();
+
+        createSwapChain();  // 重建swap chain。可以把旧的swap chain传给VkSwapchainCreateInfoKHR的oldSwapChain字段避免创建新swap chain之前停止所有渲染
+        createImageViews();  // 直接基于swap chain需要重建
+        createFramebuffers();  // 直接基于swap chain需要重建
     }
 
     void createInstance() {
@@ -770,13 +809,23 @@ private:
     // rendering
     void drawFrame() {
         vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);  // 绘制开始前等待上一帧结束，这样command buffer和semaphor可用。避免第一帧被阻塞需要设置VK_FENCE_CREATE_SIGNALED_BIT
-        vkResetFences(device, 1, &inFlightFences[currentFrame]);  // 手动重置fence为无信号
 
         // 从swap chain取图像
         // semaphore是完成使用图像时发出的同步对象，是可以开始绘制的时间点。这里也可以使用fence来同步，但现在只用semaphore
         // imageIndex输出可用的swap chain image索引，使用该索引来选择VkFrameBuffer
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+        VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+        
+        // swap chain recreation：VK_ERROR_OUT_OF_DATE_KHR表示surface和swap chain不兼容，需要重建swap chain，一般改变window会发生
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreateSwapChain();
+            return;
+        } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {  // VK_SUBOPTIMAL_KHR：swap chain仍然可以present到surface但是surface属性不完全匹配
+            throw std::runtime_error("failed to acquire swap chain image!");
+        }
+
+        // swap chain recreation：确定提交时重置fence，避免在swap chain检查前重置，可能造成提前退出drawframe而command buffer未提交导致fence信号发不出来导致死锁
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);  // 手动重置fence为无信号
 
         // 记录command buffer
         vkResetCommandBuffer(commandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
@@ -819,7 +868,15 @@ private:
 
         presentInfo.pImageIndices = &imageIndex;  // 传输的swap chain image索引
 
-        vkQueuePresentKHR(presentQueue, &presentInfo);  // 向swapchain提交present图像请求
+        result = vkQueuePresentKHR(presentQueue, &presentInfo);  // 向swapchain提交present图像请求
+
+        // swap chain recreation：这里如果swap chain属性不完全符合surface也要重建
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
+            framebufferResized = false;
+            recreateSwapChain();
+        } else if (result != VK_SUCCESS) {
+            throw std::runtime_error("failed to present swap chain image!");
+        }
 
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;  // frames in flight：切换资源
     }
