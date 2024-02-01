@@ -159,8 +159,13 @@ private:
     VkPipeline graphicsPipeline;  // pipeline
 
     VkCommandPool commandPool;  // command buffer：命令池
+
+    // vertex buffer：buffer和memory分离，能更好的资源复用aliasing
+    VkBuffer vertexBuffer;
+    VkDeviceMemory vertexBufferMemory;
+
     // frames in flight：command buffer和同步对象对每个帧都创建一个，全改成vector
-    std::vector<VkCommandBuffer>  commandBuffers;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
+    std::vector<VkCommandBuffer> commandBuffers;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
 
     // rendering：同步原语
     std::vector<VkSemaphore> imageAvailableSemaphores;
@@ -202,6 +207,7 @@ private:
         createGraphicsPipeline();  // pipeline
         createFramebuffers();  // framebuffer
         createCommandPool();  // command buffer
+        createVertexBuffer();  // vertex buffer
         createCommandBuffer();  // command buffer
         createSyncObjects();  // rendering
     }
@@ -233,8 +239,10 @@ private:
 
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-
         vkDestroyRenderPass(device, renderPass, nullptr);
+
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        vkFreeMemory(device, vertexBufferMemory, nullptr);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
@@ -751,6 +759,68 @@ private:
             throw std::runtime_error("failed to create command pool!");
         }
     }
+    
+    // vertex buffer：buffer是内存区域，用于向显卡提供读取的数据。buffer不会自动分配内存需要手动分配
+    void createVertexBuffer() {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = sizeof(vertices[0]) * vertices.size();  // buffer大小
+        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;  // 数据用法，这里作为顶点缓冲区
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;  // 和swap chain image一样buffer也可以在多个队列中共享，这里是独占访问
+
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create vertex buffer!");
+        }
+
+        // 为buffer分配内存
+        // 这里体现了aliasing资源复用，把buffer这种资源概念和实际物理内存分离，方便复用
+        // findMemoryType包含三个字段如下：
+        // size：所需内存大小，和buffer大小可能不同
+        // alignment：buffer在分配的内存区域中的偏移量，和buffer的usage和flags有关
+        // memoryTypeBits：适用于buffer内存类型的位字段
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);  // 查询内存需求
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        // 要找到适合buffer的内存类型，并且需要能够写入，所以需要提供属性
+        // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT属性表示可以映射从而可以从cpu写入顶点数据
+        // VK_MEMORY_PROPERTY_HOST_COHERENT_BIT属性用于cache一致性，因为结束映射时驱动程序可能不会立刻把数据写入buffer，也有可能反过来buffer数据在映射内存中不可见
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate vertex buffer memory!");
+        }
+
+        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);  // 关联内存和buffer
+
+        // 复制顶点数据到buffer中
+        // 根据之前设置的属性VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT需要将buffer内存映射到cpu可访问内存
+        // 结束映射时保持cache两种方法：
+        // 第一种，一致性使用VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        // 第二种，写入映射内存后调用vkFlushMappedMemoryRanges刷新数据到buffer，读取映射内存数据前用vkInvalidateMappedMemoryRanges让buffer把数据同步到映射内存中
+        // 使用一致性内存并不是gpu实际可见，gpu传输数据在后台发生，只能保证下次vkQueueSubmit时传输完成
+        void* data;
+        vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
+            memcpy(data, vertices.data(), (size_t) bufferInfo.size);
+        vkUnmapMemory(device, vertexBufferMemory);
+    }
+
+    // vertex buffer：根据缓冲区需求typeFilter以及自己的需求porperties来找到合适的内存类型
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+        VkPhysicalDeviceMemoryProperties memProperties;  // 包含memoryTypes和memoryHeaps。memoryHeaps是内存堆，是不同的内存资源，不同堆的性能会不同
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);  // 查询可用的内存类型
+
+        // 迭代内存类型，typeFilter表示适合的内存类型，和i进行and判断排除不适用的内存类型，然后查看当前内存类型的属性是否符合properties指定的属性
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+
+        throw std::runtime_error("failed to find suitable memory type!");
+    }
 
     // command buffer：创建command buffer
     void createCommandBuffer() {
@@ -812,12 +882,17 @@ private:
             scissor.offset = {0, 0};
             scissor.extent = swapChainExtent;
             vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+            
+            // vertex buffer：绑定顶点
+            VkBuffer vertexBuffers[] = {vertexBuffer};
+            VkDeviceSize offsets[] = {0};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 
             // vertexCount：顶点数量。即使不设置顶点缓冲区也需要设置
             // instanceCount：用于实例化渲染
             // firstVertex：顶点缓冲区的偏移量，定义gl_VertexIndex最小值
             // firstInstance：实例化的偏移量，定义gl_InstanceIndex最小值
-            vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+            vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
 
         vkCmdEndRenderPass(commandBuffer);
 
