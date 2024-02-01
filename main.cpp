@@ -1,6 +1,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <glm/glm.hpp>  // vertex input：顶点数据
+
 #include <iostream>
 #include <fstream>  // shader module：读取文件
 #include <stdexcept>
@@ -78,6 +80,48 @@ struct SwapChainSupportDetails {
     VkSurfaceCapabilitiesKHR capabilities;
     std::vector<VkSurfaceFormatKHR> formats;
     std::vector<VkPresentModeKHR> presentModes;
+};
+
+// vertex input：顶点数据定义
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    // 描述上传数据到gpu后如何加载到vs中
+    // 主要描述数据之间的间距以及数据是逐顶点还是逐实例
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);  // 顶点数据的字节数间隔
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;  // 表示每个顶点后移到下个顶点，还可以是VK_VERTEX_INPUT_RATE_INSTANCE，表示每个实例后移到下个实例
+
+        return bindingDescription;
+    }
+
+    // 描述如何从绑定的顶点数据块中提取顶点属性
+    // 描述传递给顶点着色器的属性的类型，从哪个bind加载它们以及在哪个偏移量
+    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};  // 2个描述分别是pos和color
+
+        attributeDescriptions[0].binding = 0;  // binding位置
+        attributeDescriptions[0].location = 0;  // 对应vs中的location
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;  // 对应vec2，但是需要用颜色格式指定
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);  // offset是属性相对于顶点数据开始的便宜，offsetof是宏，这里计算Vertex结构体中成员pos的偏移
+
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
+};
+
+// vertex input：创建顶点数据
+const std::vector<Vertex> vertices = {
+    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
 };
 
 class HelloTriangleApplication {
@@ -559,8 +603,15 @@ private:
         // fixed function：描述顶点数据格式
         VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
         vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 0;  // 主要描述数据之间的间距以及数据是逐顶点还是逐实例
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;  // 传递给顶点着色器的属性的类型，从哪个bind加载它们以及在哪个偏移量
+
+        // vertex input：设置管道接受的顶点格式
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+        vertexInputInfo.vertexBindingDescriptionCount = 1;  // 主要描述数据之间的间距以及数据是逐顶点还是逐实例
+        vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());;  // 传递给顶点着色器的属性的类型，从哪个bind加载它们以及在哪个偏移量
+        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+        vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
         // fixed function：决定图元类型以及是否开启图元复用
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
