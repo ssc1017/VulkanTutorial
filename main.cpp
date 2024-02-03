@@ -119,9 +119,15 @@ struct Vertex {
 
 // vertex input：创建顶点数据
 const std::vector<Vertex> vertices = {
-    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+// index buffer：索引数据
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
 };
 
 class HelloTriangleApplication {
@@ -163,6 +169,9 @@ private:
     // vertex buffer：buffer和memory分离，能更好的资源复用aliasing
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
+    // index buffer：index buffer和memory
+    VkBuffer indexBuffer;
+    VkDeviceMemory indexBufferMemory;
 
     // frames in flight：command buffer和同步对象对每个帧都创建一个，全改成vector
     std::vector<VkCommandBuffer> commandBuffers;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
@@ -208,6 +217,7 @@ private:
         createFramebuffers();  // framebuffer
         createCommandPool();  // command buffer
         createVertexBuffer();  // vertex buffer
+        createIndexBuffer();  // index buffer
         createCommandBuffer();  // command buffer
         createSyncObjects();  // rendering
     }
@@ -240,6 +250,9 @@ private:
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
+
+        vkDestroyBuffer(device, indexBuffer, nullptr);
+        vkFreeMemory(device, indexBufferMemory, nullptr);
 
         vkDestroyBuffer(device, vertexBuffer, nullptr);
         vkFreeMemory(device, vertexBufferMemory, nullptr);
@@ -794,6 +807,28 @@ private:
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    // index buffer：使用staging buffer传数据给index buffer
+    void createIndexBuffer() {
+        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+            memcpy(data, indices.data(), (size_t) bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // VK_BUFFER_USAGE_INDEX_BUFFER_BIT：用于index buffer
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer, indexBufferMemory);
+
+        copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -948,11 +983,13 @@ private:
             VkDeviceSize offsets[] = {0};
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 
-            // vertexCount：顶点数量。即使不设置顶点缓冲区也需要设置
+            // index buffer：绑定索引，可能是uint16或32
+            vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
             // instanceCount：用于实例化渲染
             // firstVertex：顶点缓冲区的偏移量，定义gl_VertexIndex最小值
             // firstInstance：实例化的偏移量，定义gl_InstanceIndex最小值
-            vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+            vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
         vkCmdEndRenderPass(commandBuffer);
 
