@@ -762,14 +762,47 @@ private:
     
     // vertex buffer：buffer是内存区域，用于向显卡提供读取的数据。buffer不会自动分配内存需要手动分配
     void createVertexBuffer() {
+        // staging buffer：之前使用host可见的buffer作为vertex buffer，现在选择device buffer作为vertex buffer
+        // 所以staging buffer选择VK_BUFFER_USAGE_TRANSFER_SRC_BIT用于内存传输
+        // host可见buffer可以直接map，然后把数据通过复制命令复制到device buffer中
+        VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        // VK_BUFFER_USAGE_VERTEX_BUFFER_BIT：缓冲区作为内存传输操作的src
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        // 复制顶点数据到buffer中
+        // 根据之前设置的属性VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT需要将buffer内存映射到cpu可访问内存
+        // 结束映射时保持cache两种方法：
+        // 第一种，一致性使用VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        // 第二种，写入映射内存后调用vkFlushMappedMemoryRanges刷新数据到buffer，读取映射内存数据前用vkInvalidateMappedMemoryRanges让buffer把数据同步到映射内存中
+        // 使用一致性内存并不是gpu实际可见，gpu传输数据在后台发生，只能保证下次vkQueueSubmit时传输完成
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+            memcpy(data, vertices.data(), (size_t) bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // VK_BUFFER_USAGE_TRANSFER_DST_BIT：缓冲区作为内存传输的dst
+        // VK_BUFFER_USAGE_VERTEX_BUFFER_BIT：用于vertex buffer
+        // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT：选择device buffer
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+
+        copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufferInfo.size = sizeof(vertices[0]) * vertices.size();  // buffer大小
-        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;  // 数据用法，这里作为顶点缓冲区
+        bufferInfo.size = size;  // buffer大小
+        bufferInfo.usage = usage;  // 数据用法，这里作为顶点缓冲区
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;  // 和swap chain image一样buffer也可以在多个队列中共享，这里是独占访问
 
-        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create vertex buffer!");
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create buffer!");
         }
 
         // 为buffer分配内存
@@ -779,7 +812,7 @@ private:
         // alignment：buffer在分配的内存区域中的偏移量，和buffer的usage和flags有关
         // memoryTypeBits：适用于buffer内存类型的位字段
         VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);  // 查询内存需求
+        vkGetBufferMemoryRequirements(device, buffer, &memRequirements);  // 查询内存需求
 
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -787,24 +820,51 @@ private:
         // 要找到适合buffer的内存类型，并且需要能够写入，所以需要提供属性
         // VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT属性表示可以映射从而可以从cpu写入顶点数据
         // VK_MEMORY_PROPERTY_HOST_COHERENT_BIT属性用于cache一致性，因为结束映射时驱动程序可能不会立刻把数据写入buffer，也有可能反过来buffer数据在映射内存中不可见
-        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
 
-        if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
-            throw std::runtime_error("failed to allocate vertex buffer memory!");
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate buffer memory!");
         }
 
-        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);  // 关联内存和buffer
+        vkBindBufferMemory(device, buffer, bufferMemory, 0);  // 关联内存和buffer
+    }
 
-        // 复制顶点数据到buffer中
-        // 根据之前设置的属性VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT需要将buffer内存映射到cpu可访问内存
-        // 结束映射时保持cache两种方法：
-        // 第一种，一致性使用VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-        // 第二种，写入映射内存后调用vkFlushMappedMemoryRanges刷新数据到buffer，读取映射内存数据前用vkInvalidateMappedMemoryRanges让buffer把数据同步到映射内存中
-        // 使用一致性内存并不是gpu实际可见，gpu传输数据在后台发生，只能保证下次vkQueueSubmit时传输完成
-        void* data;
-        vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
-            memcpy(data, vertices.data(), (size_t) bufferInfo.size);
-        vkUnmapMemory(device, vertexBufferMemory);
+    // staging buffer：把数据从staging buffer复制到vertex buffer
+    // 内存传输操作需要command buffer
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        // 分配command buffer
+        // 这种command buffer执行一次后立即销毁，所以是短期的
+        // 优化短期command buffer可以单独创建command pool，command pool设置标志VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);  // allocate次数实际有限，一般需要自定义分配器，通过offset拆分对象分配
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;  // 告诉驱动只使用一次command buffer
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+            VkBufferCopy copyRegion{};  // 定义拷贝区域
+            copyRegion.size = size;
+            vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        vkEndCommandBuffer(commandBuffer);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue);  // 这里简单等待队列执行完成，也可以用fence，使用fence就能安排多个传输并等待所有完成而不是一次执行一个传输，比如创建多个command buffer进行传输
+
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
     }
 
     // vertex buffer：根据缓冲区需求typeFilter以及自己的需求porperties来找到合适的内存类型
