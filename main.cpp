@@ -1,11 +1,14 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#define GLM_FORCE_RADIANS  // descriptor set layout：确保glm函数使用弧度作为参数
 #include <glm/glm.hpp>  // vertex input：顶点数据
+#include <glm/gtc/matrix_transform.hpp>  // descriptor set layout：ubo的mvp矩阵
 
 #include <iostream>
 #include <fstream>  // shader module：读取文件
 #include <stdexcept>
+#include <chrono>  // descriptor set layout：每秒旋转90度
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -117,6 +120,13 @@ struct Vertex {
     }
 };
 
+// descriptor set layout：mvp矩阵，glm矩阵数据的二进制方式与着色器期望的方式一致，所以能直接拷贝到vkbuffer
+struct UniformBufferObject {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+
 // vertex input：创建顶点数据
 const std::vector<Vertex> vertices = {
     {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
@@ -161,6 +171,7 @@ private:
     std::vector<VkFramebuffer> swapChainFramebuffers;  // framebuffer
 
     VkRenderPass renderPass;  // renderpass
+    VkDescriptorSetLayout descriptorSetLayout;  // descriptor set layout：描述了shader中的binding
     VkPipelineLayout pipelineLayout;  // fixed function：用于传递uniform
     VkPipeline graphicsPipeline;  // pipeline
 
@@ -172,6 +183,10 @@ private:
     // index buffer：index buffer和memory
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
+
+    std::vector<VkBuffer> uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void*> uniformBuffersMapped;
 
     // frames in flight：command buffer和同步对象对每个帧都创建一个，全改成vector
     std::vector<VkCommandBuffer> commandBuffers;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
@@ -213,12 +228,14 @@ private:
         createSwapChain();  // swapchain
         createImageViews();  // imageview
         createRenderPass();  // renderpass
+        createDescriptorSetLayout();  // descriptor set layout
         createGraphicsPipeline();  // pipeline
         createFramebuffers();  // framebuffer
         createCommandPool();  // command buffer
         createVertexBuffer();  // vertex buffer
         createIndexBuffer();  // index buffer
-        createCommandBuffer();  // command buffer
+        createUniformBuffers();  // ubo
+        createCommandBuffers();  // command buffer
         createSyncObjects();  // rendering
     }
 
@@ -250,6 +267,13 @@ private:
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
@@ -598,6 +622,25 @@ private:
         }
     }
 
+    // descriptor set layout：提供pipeline创建的shader中每个descriptor binding的所有细节，类似于设置顶点属性和顶点索引
+    void createDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+        uboLayoutBinding.binding = 0;  // shader使用的binding
+        uboLayoutBinding.descriptorCount = 1;  // 如果是数组那么指定数组的数量，比如骨骼动画中每个bone有单独的变换可以设置成变换的数组
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;  // descriptor是一个ubo
+        uboLayoutBinding.pImmutableSamplers = nullptr;
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;  // 着色器阶段，这里是vs
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
+    }
+
     // pipeline：创建pipeline
     void createGraphicsPipeline() {
         auto vertShaderCode = readFile("/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/shaders/vert.spv");
@@ -694,7 +737,8 @@ private:
         // fixed function：shader中的uniform需要pipelinelayout来指定
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0;
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;  // descriptor set layout：指定pipeline需要使用的descriptor set layout
         pipelineLayoutInfo.pushConstantRangeCount = 0;  // 指定了pushConstant，也是传递uniform的方式
 
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
@@ -829,6 +873,21 @@ private:
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    // descriptor set layout：根据frames in flight创建多个ubo，避免更新的ubo正在被使用。不使用staging buffer因为每帧都会更新ubo，反而造成性能下降
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+        }
+    }
+
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -918,7 +977,7 @@ private:
     }
 
     // command buffer：创建command buffer
-    void createCommandBuffer() {
+    void createCommandBuffers() {
         commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);  // frames in flight：每个帧创建一个command buffer
 
         VkCommandBufferAllocateInfo allocInfo{};
@@ -1029,6 +1088,22 @@ private:
 
     }
 
+    // descriptor set layout：更新ubo
+    void updateUniformBuffer(uint32_t currentImage) {
+        static auto startTime = std::chrono::high_resolution_clock::now();  // static记录一次
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        UniformBufferObject ubo{};
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));  // 使用时间来旋转而不是帧数，每秒转90度
+        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));  // 从上方45度往下看
+        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float) swapChainExtent.height, 0.1f, 10.0f);  // fov是45度，然后长宽比用当前swap chain，然后设置近平面远平面
+        ubo.proj[1][1] *= -1;  // glm是为opengl设计，其中裁剪空间的Y是倒置的，补偿方法是把投影矩阵的y轴缩放翻转
+
+        memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+    }
+
     // rendering
     void drawFrame() {
         vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);  // 绘制开始前等待上一帧结束，这样command buffer和semaphor可用。避免第一帧被阻塞需要设置VK_FENCE_CREATE_SIGNALED_BIT
@@ -1046,6 +1121,9 @@ private:
         } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {  // VK_SUBOPTIMAL_KHR：swap chain仍然可以present到surface但是surface属性不完全匹配
             throw std::runtime_error("failed to acquire swap chain image!");
         }
+
+        // descriptor set layout：更新ubo
+        updateUniformBuffer(currentFrame);
 
         // swap chain recreation：确定提交时重置fence，避免在swap chain检查前重置，可能造成提前退出drawframe而command buffer未提交导致fence信号发不出来导致死锁
         vkResetFences(device, 1, &inFlightFences[currentFrame]);  // 手动重置fence为无信号
