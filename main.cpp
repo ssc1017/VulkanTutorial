@@ -121,10 +121,12 @@ struct Vertex {
 };
 
 // descriptor set layout：mvp矩阵，glm矩阵数据的二进制方式与着色器期望的方式一致，所以能直接拷贝到vkbuffer
+// alignas是为了保证类型对齐，vulkan有要求对齐方式
+// 另一种保证对齐的方法是在include glm之前使用#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES，不过在嵌套体结构中会失效
 struct UniformBufferObject {
-    glm::mat4 model;
-    glm::mat4 view;
-    glm::mat4 proj;
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
 };
 
 // vertex input：创建顶点数据
@@ -188,6 +190,10 @@ private:
     std::vector<VkDeviceMemory> uniformBuffersMemory;
     std::vector<void*> uniformBuffersMapped;
 
+    // descriptor set：descriptor pool和set
+    VkDescriptorPool descriptorPool;
+    std::vector<VkDescriptorSet> descriptorSets;
+
     // frames in flight：command buffer和同步对象对每个帧都创建一个，全改成vector
     std::vector<VkCommandBuffer> commandBuffers;  // command buffer：在command pool被销毁时会自动释放所以不需要显示清理
 
@@ -235,6 +241,8 @@ private:
         createVertexBuffer();  // vertex buffer
         createIndexBuffer();  // index buffer
         createUniformBuffers();  // ubo
+        createDescriptorPool();  // descriptor pool
+        createDescriptorSets();  // descriptor set
         createCommandBuffers();  // command buffer
         createSyncObjects();  // rendering
     }
@@ -272,6 +280,8 @@ private:
             vkDestroyBuffer(device, uniformBuffers[i], nullptr);
             vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
         }
+
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
@@ -697,7 +707,7 @@ private:
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL;  // 确定如何生成片段，比如可以选择输出线框或者输出顶点
         rasterizer.lineWidth = 1.0f;  // 线条粗细
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;  // 面剔除，这里剔除背面
-        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;  // 视为正面的顶点顺序，这里顺时针
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;  // descriptor set：因为mvp矩阵对y轴进行了反转所以视逆时针为正面
         rasterizer.depthBiasEnable = VK_FALSE;  // 主要是用于shadow map的深度偏移，可以添加常值或者片段斜率作为偏移量
 
         // fixed function：硬件抗锯齿
@@ -888,6 +898,56 @@ private:
         }
     }
 
+    // descriptor set：创建pool用于分配descriptor set
+    void createDescriptorPool() {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;  // descriptor类型
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);  // descriptor数量
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);  // descriptor set最大数量
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+
+    // descriptor set：创建descriptor set
+    void createDescriptorSets() {
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;  // 指定descriptor pool
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);  // 为每一帧创建一个descriptor set
+        allocInfo.pSetLayouts = layouts.data();  // 设置layout
+
+        descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            VkDescriptorBufferInfo bufferInfo{};  // 指定descriptor引用的ubo
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(UniformBufferObject);
+
+            VkWriteDescriptorSet descriptorWrite{};  // 填充descriptor set
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrite.dstBinding = 0;  // ubo绑定到索引0
+            descriptorWrite.dstArrayElement = 0;  // 指定descriptor数组开始的索引
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrite.descriptorCount = 1;  // 指定descriptor数组更新多少个元素
+            descriptorWrite.pBufferInfo = &bufferInfo;
+
+            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);  // 除了write还可以接受copy参数用于复制descriptor
+        }
+    }
+
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1045,6 +1105,9 @@ private:
             // index buffer：绑定索引，可能是uint16或32
             vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
+            // descriptor set：绑定descriptor set到shader中实际的descriptor
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
+
             // instanceCount：用于实例化渲染
             // firstVertex：顶点缓冲区的偏移量，定义gl_VertexIndex最小值
             // firstInstance：实例化的偏移量，定义gl_InstanceIndex最小值
@@ -1055,6 +1118,7 @@ private:
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
             throw std::runtime_error("failed to record command buffer!");
         }
+
     }
 
     // rendering：创建同步对象。因为许多vulkan api调用是异步的，在操作完成前就返回了
