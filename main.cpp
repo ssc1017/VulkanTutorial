@@ -5,6 +5,10 @@
 #include <glm/glm.hpp>  // vertex input：顶点数据
 #include <glm/gtc/matrix_transform.hpp>  // descriptor set layout：ubo的mvp矩阵
 
+// texture image: 引入纹理的库
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <iostream>
 #include <fstream>  // shader module：读取文件
 #include <stdexcept>
@@ -179,6 +183,10 @@ private:
 
     VkCommandPool commandPool;  // command buffer：命令池
 
+    // image texture：导入纹理
+    VkImage textureImage;
+    VkDeviceMemory textureImageMemory;
+
     // vertex buffer：buffer和memory分离，能更好的资源复用aliasing
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
@@ -238,6 +246,7 @@ private:
         createGraphicsPipeline();  // pipeline
         createFramebuffers();  // framebuffer
         createCommandPool();  // command buffer
+        createTextureImage();  // texture image
         createVertexBuffer();  // vertex buffer
         createIndexBuffer();  // index buffer
         createUniformBuffers();  // ubo
@@ -282,6 +291,9 @@ private:
         }
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+
+        vkDestroyImage(device, textureImage, nullptr);
+        vkFreeMemory(device, textureImageMemory, nullptr);
 
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
@@ -826,6 +838,162 @@ private:
             throw std::runtime_error("failed to create command pool!");
         }
     }
+
+    // texture image：创建texture image，会使用command buffer所以需要在command pool构建后执行
+    void createTextureImage() {
+        int texWidth, texHeight, texChannels;
+        stbi_uc* pixels = stbi_load("/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);  // 强制加载一个alpha通道即使没有alpha，保证图片都能读取
+        VkDeviceSize imageSize = texWidth * texHeight * 4;
+
+        if (!pixels) {
+            throw std::runtime_error("failed to load texture image!");
+        }
+
+        // 创建staging buffer这里在host创建，这样才能把数据map
+        // VK_MEMORY_PROPERTY_HOST_COHERENT_BIT确保host visible
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);  // 建立映射
+            memcpy(data, pixels, static_cast<size_t>(imageSize));
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        stbi_image_free(pixels);  // 清理原始像素阵列
+
+        // 上面buffer构建完成后也可以在shader中访问，但是最好创建image进行快速二维检索颜色
+        // 下面把buffer数据传给image
+        // 创建image对象
+        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+
+        // 把image布局转换到VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL，旧layout是undefined因为我们不关心image原本的内容
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        // 拷贝buffer内容到image
+            copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+        // 转换image布局，允许让着色器进行采样
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        // 传输完成清楚staging buffer
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    // image texture：创建image
+    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;  // 指定image类型，处理成什么坐标系，可以是一维二维三维
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = format;  // 格式和buffer一样否则拷贝会失败
+        imageInfo.tiling = tiling;  // 可以是linear或optimal，linear是行主序，optimal是优化排序，如果要直接访问需要用linear，但我们使用了staging buffer处理直接访问所以这里用optimize达到image最佳访问
+        // 有两种，undefined：不能被gpu使用，第一次转换丢弃texels，preinitialized：不能被gpu使用，第一次转换保留texels
+        //很少会选择preinitialized，除非是和tiling linear结合使用的staging image，这种情况会把texel数据传到image并且不丢失数据的情况下把图像作为传输源
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = usage;  // 作为传输目标，并且包含sampled bit用于着色器访问
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;  // 可以设置多重采样，只有attchment的image需要设置
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;  // 被一个queuefamily使用
+
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image!");
+        }
+
+        // 给image分配内存和buffer分配内存方法类似
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(device, image, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate image memory!");
+        }
+
+        vkBindImageMemory(device, image, imageMemory, 0);
+    }
+
+    // image texture：处理layout转换，确保image处于正确layout中
+    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // 使用pipeline barrier用于同步访问资源
+        // 比如buffer读取之前完成buffer写入
+        // 使用VK_SHARING_MODE_EXCLUSIVE时，可以用于image layout转换和转移queuefamily所有权
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = oldLayout;  // 旧layout，如果不关心现有内容可以使用undefined
+        barrier.newLayout = newLayout;  // 新layout
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;  // 如果转移queue family所有权需要设置queue family索引，否则必须设置ignored因为ignored不是默认值
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;  // 指定影响的image
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        VkPipelineStageFlags sourceStage;  // 指定发生在barrier之前的操作和资源
+        VkPipelineStageFlags destinationStage;  // 指定在barrier上等待的操作和资源
+
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {  // undefined到传输操作
+            barrier.srcAccessMask = 0;  // 写操作不需要等待任何操作，指定空掩码
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;  // 写操作进行等待
+
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;  // VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT是最早的管线阶段，也就是不等待
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;  // VK_PIPELINE_STAGE_TRANSFER_BIT并不是一个真实管线阶段，而是传输的伪阶段
+        } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {  // 传输操作到shader读取操作
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;  // 需要写操作先发生
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;  // shader读取，主要是fragment shader进行纹理采样，所以fs设置时需要指定是否有读取操作
+
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;  // 需要transfer阶段先发生
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;  // shader读取阶段等待
+        } else {
+            throw std::invalid_argument("unsupported layout transition!");
+        }
+
+        // 提交barrier命令
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            sourceStage, destinationStage,  // sourceStage指定哪个管线阶段发生的操作在barrier之前发生，destinationStage指定哪个管线阶段发生的操作在barrier上等待
+            0,  // 可以设置成VK_DEPENDENCY_BY_REGION_BIT，把barrier设置区域状态，允许写完的区域进行读取，更细粒度
+            0, nullptr,  // 内存屏障，memory barrier
+            0, nullptr,  // 缓冲区内存屏障，buffer memory barrier
+            1, &barrier  // 图像内存屏障，image memory barrier
+        );
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    // image texture：辅助函数用于拷贝buffer到image
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};  // 决定buffer哪一部分拷贝到image哪一部分
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {
+            width,
+            height,
+            1
+        };
+
+        // 执行拷贝命令，其中VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL是因为我们假设这时候image已经是最佳布局
+        vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        endSingleTimeCommands(commandBuffer);
+    }
     
     // vertex buffer：buffer是内存区域，用于向显卡提供读取的数据。buffer不会自动分配内存需要手动分配
     void createVertexBuffer() {
@@ -983,9 +1151,8 @@ private:
         vkBindBufferMemory(device, buffer, bufferMemory, 0);  // 关联内存和buffer
     }
 
-    // staging buffer：把数据从staging buffer复制到vertex buffer
-    // 内存传输操作需要command buffer
-    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+    // image texture：创建短期command buffer，因为很多地方要用到所以从copybuffer中提取出函数
+    VkCommandBuffer beginSingleTimeCommands() {
         // 分配command buffer
         // 这种command buffer执行一次后立即销毁，所以是短期的
         // 优化短期command buffer可以单独创建command pool，command pool设置标志VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
@@ -1004,10 +1171,11 @@ private:
 
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-            VkBufferCopy copyRegion{};  // 定义拷贝区域
-            copyRegion.size = size;
-            vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        return commandBuffer;
+    }
 
+    // image texture：结束command buffer录制并执行
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
         vkEndCommandBuffer(commandBuffer);
 
         VkSubmitInfo submitInfo{};
@@ -1019,6 +1187,19 @@ private:
         vkQueueWaitIdle(graphicsQueue);  // 这里简单等待队列执行完成，也可以用fence，使用fence就能安排多个传输并等待所有完成而不是一次执行一个传输，比如创建多个command buffer进行传输
 
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+
+    // staging buffer：把数据从staging buffer复制到vertex buffer
+    // 内存传输操作需要command buffer
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferCopy copyRegion{};  // 定义拷贝区域
+        copyRegion.size = size;
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        endSingleTimeCommands(commandBuffer);
     }
 
     // vertex buffer：根据缓冲区需求typeFilter以及自己的需求porperties来找到合适的内存类型
