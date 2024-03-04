@@ -186,6 +186,9 @@ private:
     // image texture：导入纹理
     VkImage textureImage;
     VkDeviceMemory textureImageMemory;
+    // sampler：设置纹理采样
+    VkImageView textureImageView;  // 本质上就是image view
+    VkSampler textureSampler;
 
     // vertex buffer：buffer和memory分离，能更好的资源复用aliasing
     VkBuffer vertexBuffer;
@@ -247,6 +250,8 @@ private:
         createFramebuffers();  // framebuffer
         createCommandPool();  // command buffer
         createTextureImage();  // texture image
+        createTextureImageView();
+        createTextureSampler();
         createVertexBuffer();  // vertex buffer
         createIndexBuffer();  // index buffer
         createUniformBuffers();  // ubo
@@ -291,6 +296,9 @@ private:
         }
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+
+        vkDestroySampler(device, textureSampler, nullptr);
+        vkDestroyImageView(device, textureImageView, nullptr);
 
         vkDestroyImage(device, textureImage, nullptr);
         vkFreeMemory(device, textureImageMemory, nullptr);
@@ -469,6 +477,7 @@ private:
         }
 
         VkPhysicalDeviceFeatures deviceFeatures{};
+        deviceFeatures.samplerAnisotropy = VK_TRUE;  // sampler：允许支持各向异性采样，可选操作需要打开
 
         // device的创建信息
         VkDeviceCreateInfo createInfo{};
@@ -566,27 +575,7 @@ private:
         swapChainImageViews.resize(swapChainImages.size());
 
         for (size_t i = 0; i < swapChainImages.size(); i++) {
-            VkImageViewCreateInfo createInfo{};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = swapChainImages[i];
-            // type和format描述了如何解释图像数据
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            createInfo.format = swapChainImageFormat;
-            // 允许调整通道，比如可以都映射到r通道形成单色纹理
-            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-            // subresourcerange描述如何使用图像以及哪一部分，这里用作color target
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-
-            if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
-                throw std::runtime_error("failed to create image views!");
-            }
+            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat);
         }
     }
 
@@ -877,6 +866,64 @@ private:
         // 传输完成清楚staging buffer
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    // sampler：创建texture image view
+    void createTextureImageView() {
+        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB);
+    }
+
+    // sampler：创建采样器
+    void createTextureSampler() {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);  // 通过物理设备查询最佳采样数量
+
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.anisotropyEnable = VK_TRUE;  // 开启各向异性过滤，一般开启
+        samplerInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;  // 限制用于计算texel颜色的样本数量
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;  // 指定环绕模式为border时的颜色
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;  // 指定坐标系统，这里是01坐标，也可以是0 width，0 height坐标
+        samplerInfo.compareEnable = VK_FALSE;  // 用于shadow map的PCF，开启后texel会首先与一个值比较然后把结果用于过滤
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;  // 用于PCF
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create texture sampler!");
+        }
+    }
+
+    // sampler：texture采样以及swap chain都要image view
+    VkImageView createImageView(VkImage image, VkFormat format) {
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = image;
+        // type和format描述了如何解释图像数据
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        // 允许调整通道，比如可以都映射到r通道形成单色纹理，可以省略这部分
+        viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        // subresourcerange描述如何使用图像以及哪一部分，这里用作color target
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        VkImageView imageView;
+        if (vkCreateImageView(device, &viewInfo, nullptr, &imageView) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image view!");
+        }
+
+        return imageView;
     }
 
     // image texture：创建image
@@ -1534,7 +1581,11 @@ private:
             swapChainAdequate = !swapChainSupport.formats.empty() && !swapChainSupport.presentModes.empty();
         }
 
-        return indices.isComplete() && extensionsSupported && swapChainAdequate;
+        // sampler：检查物理设备是否支持各向异性采样，一般都会支持
+        VkPhysicalDeviceFeatures supportedFeatures;
+        vkGetPhysicalDeviceFeatures(device, &supportedFeatures);
+
+        return indices.isComplete() && extensionsSupported && swapChainAdequate && supportedFeatures.samplerAnisotropy;
     }
 
     // swapchain：检查设备是否支持所有extension
