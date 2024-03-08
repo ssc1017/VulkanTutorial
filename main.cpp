@@ -3,12 +3,19 @@
 
 #define GLM_FORCE_RADIANS  // descriptor set layout：确保glm函数使用弧度作为参数
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE  // depth buffering：glm生成的投影举证默认使用opengl的深度范围-1 1，而vulkan的深度范围是0 1
+#define GLM_ENABLE_EXPERIMENTAL  // model loading：gtx/hash是glm的一个实验性扩展需要打开
 #include <glm/glm.hpp>  // vertex input：顶点数据
 #include <glm/gtc/matrix_transform.hpp>  // descriptor set layout：ubo的mvp矩阵
+#include <glm/gtx/hash.hpp>
 
 // texture image: 引入纹理的库
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+
+// model loading：加载obj文件
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tiny_obj_loader.h"
 
 #include <iostream>
 #include <fstream>  // shader module：读取文件
@@ -23,6 +30,9 @@
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
+
+const std::string MODEL_PATH = "/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/models/AC_Unit.obj";
+const std::string TEXTURE_PATH = "/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/textures/texture.jpg";
 
 // frames in flight：fence等待前一帧完成cpu才能继续执行，这样cpu占用降低
 // 解决方法是允许多个帧同时进行录制command buffer
@@ -130,7 +140,21 @@ struct Vertex {
 
         return attributeDescriptions;
     }
+
+    // model loading：作为哈希键需要重载
+    bool operator==(const Vertex& other) const {
+        return pos == other.pos && color == other.color && texCoord == other.texCoord;
+    }
 };
+
+// modal loading：作为哈希键需要完成哈希函数，指定std::hash的模版特化来实现
+namespace std {
+    template<> struct hash<Vertex> {
+        size_t operator()(Vertex const& vertex) const {
+            return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
 
 // descriptor set layout：mvp矩阵，glm矩阵数据的二进制方式与着色器期望的方式一致，所以能直接拷贝到vkbuffer
 // alignas是为了保证类型对齐，vulkan有要求对齐方式
@@ -139,25 +163,6 @@ struct UniformBufferObject {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
     alignas(16) glm::mat4 proj;
-};
-
-// vertex input：创建顶点数据
-const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
-
-    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
-};
-
-// index buffer：索引数据
-const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4
 };
 
 class HelloTriangleApplication {
@@ -209,6 +214,9 @@ private:
     VkImageView textureImageView;  // 本质上就是image view
     VkSampler textureSampler;
 
+    // model loading：从模型加载的顶点和索引用vector保存
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
     // vertex buffer：buffer和memory分离，能更好的资源复用aliasing
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
@@ -272,6 +280,7 @@ private:
         createTextureImage();  // texture image
         createTextureImageView();
         createTextureSampler();
+        loadModel();
         createVertexBuffer();  // vertex buffer
         createIndexBuffer();  // index buffer
         createUniformBuffers();  // ubo
@@ -934,7 +943,7 @@ private:
     // texture image：创建texture image，会使用command buffer所以需要在command pool构建后执行
     void createTextureImage() {
         int texWidth, texHeight, texChannels;
-        stbi_uc* pixels = stbi_load("/Users/sichaoshu/workspace/VulkanTutorial/VulkanTutorial/textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);  // 强制加载一个alpha通道即使没有alpha，保证图片都能读取
+        stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);  // 强制加载一个alpha通道即使没有alpha，保证图片都能读取
         VkDeviceSize imageSize = texWidth * texHeight * 4;
 
         if (!pixels) {
@@ -1143,6 +1152,50 @@ private:
         vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
         endSingleTimeCommands(commandBuffer);
+    }
+
+    // model loading：obj文件加载，obj文件由位置、法线、纹理坐标、面组成，面通过顶点组成，顶点通过索引指向一个位置、法线、纹理坐标，使其可以重复使用整个顶点也可以重复使用顶点的属性
+    void loadModel() {
+        tinyobj::attrib_t attrib;  // attrib_t存有所有vertices、normals、texcoords
+        std::vector<tinyobj::shape_t> shapes;  // shape_t存有独立对象和其面，面由一个顶点数组组成
+        std::vector<tinyobj::material_t> materials;  // obj每个面可以定义材料和纹理这里暂时不用
+        std::string warn, err;
+
+        // obj文件中一个面其实可以包含任意数量顶点而不只是三角形，不过loadObj会默认对多个顶点的面进行三角形处理
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str())) {
+            throw std::runtime_error(warn + err);
+        }
+
+        std::unordered_map<Vertex, uint32_t> uniqueVertices{};  // 顶点去重，每个vertex对应一个index
+
+        for (const auto& shape : shapes) {
+            for (const auto& index : shape.mesh.indices) {  // 遍历顶点索引
+                Vertex vertex{};
+
+                vertex.pos = {
+                    attrib.vertices[3 * index.vertex_index + 0],
+                    attrib.vertices[3 * index.vertex_index + 1],
+                    attrib.vertices[3 * index.vertex_index + 2]
+                };
+
+                vertex.texCoord = {
+                    attrib.texcoords[2 * index.texcoord_index + 0],
+                    1.0f - attrib.texcoords[2 * index.texcoord_index + 1]  // 翻转纹理的y，因为obj认为y的0点在图像底部而我们把图像传给vulkan是自顶向下传输
+                };
+
+                vertex.color = {1.0f, 1.0f, 1.0f};
+
+                // 顶点去重，使用index，这需要Vertex类实现相等测试和哈希函数
+                // 如果map没找到相同的vertex那么把vertex索引加入到map，并增加到vertices
+                if (uniqueVertices.count(vertex) == 0) {
+                    uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+                    vertices.push_back(vertex);
+                }
+
+                // 重复或者不重复的顶点都会创建一个index
+                indices.push_back(uniqueVertices[vertex]);
+            }
+        }
     }
     
     // vertex buffer：buffer是内存区域，用于向显卡提供读取的数据。buffer不会自动分配内存需要手动分配
@@ -1455,7 +1508,7 @@ private:
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 
             // index buffer：绑定索引，可能是uint16或32
-            vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
             // descriptor set：绑定descriptor set到shader中实际的descriptor
             vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
