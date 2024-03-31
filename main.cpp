@@ -1,21 +1,20 @@
 #define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
+#include "GLFW/glfw3.h"
 
 #define GLM_FORCE_RADIANS  // descriptor set layout：确保glm函数使用弧度作为参数
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE  // depth buffering：glm生成的投影举证默认使用opengl的深度范围-1 1，而vulkan的深度范围是0 1
 #define GLM_ENABLE_EXPERIMENTAL  // model loading：gtx/hash是glm的一个实验性扩展需要打开
 #include <glm/glm.hpp>  // vertex input：顶点数据
-#include <glm/gtc/matrix_transform.hpp>  // descriptor set layout：ubo的mvp矩阵
 #include <glm/gtx/hash.hpp>
 
 // texture image: 引入纹理的库
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "thirdparty/stb/stb_image.h"
 
 
 // model loading：加载obj文件
 #define TINYOBJLOADER_IMPLEMENTATION
-#include "tiny_obj_loader.h"
+#include "thirdparty/tiny_obj/tiny_obj_loader.h"
 
 #include <iostream>
 #include <fstream>  // shader module：读取文件
@@ -27,6 +26,8 @@
 #include <optional>  // 物理设备
 #include <set>  // 窗口表面：去重物理设备用于逻辑队列创建
 #include <vulkan/vk_enum_string_helper.h>  // 帮助把VkResult转换成string，string_VkResult
+
+#include "camera.hpp"
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
@@ -170,6 +171,7 @@ public:
     void run() {
         initWindow();
         initVulkan();
+        m_camera.init(swapChainExtent.width, swapChainExtent.height);
         mainLoop();
         cleanup();
     }
@@ -243,6 +245,15 @@ private:
 
     bool framebufferResized = false;  // swap chain recreation：标记是否发生调整window大小的操作
 
+    // fps记录
+    float m_averageDuration {0.f};
+    int m_frameCount {0};
+    int m_fps {0};
+
+    // camera
+    Camera m_camera;
+    unsigned int m_gameCommand {0};
+
     void initWindow() {
         glfwInit();
 
@@ -250,10 +261,12 @@ private:
         glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
-        
+
         // swap chain recreation：设置window大小改变回调处理
         glfwSetWindowUserPointer(window, this);  // 存储this指针
         glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+
+        glfwSetKeyCallback(window, keyCallback);
     }
 
     // swap chain recreation：回调函数，在window大小变化时处理
@@ -261,6 +274,57 @@ private:
     static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
         auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));  // 取出this指针
         app->framebufferResized = true;
+    }
+
+    void onKey(int key, int scancode, int action, int mods)
+    {
+        if (action == GLFW_PRESS)
+        {
+            switch (key)
+            {
+                case GLFW_KEY_A:
+                    m_gameCommand |= (unsigned int)GameCommand::left;
+                    break;
+                case GLFW_KEY_S:
+                    m_gameCommand |= (unsigned int)GameCommand::backward;
+                    break;
+                case GLFW_KEY_W:
+                    m_gameCommand |= (unsigned int)GameCommand::forward;
+                    break;
+                case GLFW_KEY_D:
+                    m_gameCommand |= (unsigned int)GameCommand::right;
+                    break;
+                default:
+                    break;
+            }
+        }
+        else if (action == GLFW_RELEASE)
+        {
+            switch (key)
+            {
+                case GLFW_KEY_W:
+                    m_gameCommand &= (k_complement_control_command ^ (unsigned int)GameCommand::forward);
+                    break;
+                case GLFW_KEY_S:
+                    m_gameCommand &= (k_complement_control_command ^ (unsigned int)GameCommand::backward);
+                    break;
+                case GLFW_KEY_A:
+                    m_gameCommand &= (k_complement_control_command ^ (unsigned int)GameCommand::left);
+                    break;
+                case GLFW_KEY_D:
+                    m_gameCommand &= (k_complement_control_command ^ (unsigned int)GameCommand::right);
+                    break;
+                default:
+                    break;
+            }
+        }
+        m_camera.setCommand(m_gameCommand);
+    }
+
+    static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
+    {
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));  // 取出this指针
+        app->onKey(key, scancode, action, mods);
     }
 
     void initVulkan() {
@@ -290,10 +354,46 @@ private:
         createSyncObjects();  // rendering
     }
 
+    float calculateDeltaTime()
+    {
+        static auto s_lastTickTimePoint = std::chrono::high_resolution_clock::now();  // static记录一次
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float deltaTime = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - s_lastTickTimePoint).count();
+        s_lastTickTimePoint = currentTime;
+
+        return deltaTime;
+    }
+
+    static constexpr float sg_fpsAlpha = 1.f / 100;
+    void calculateFPS(float deltaTime)
+    {
+        m_frameCount++;
+
+        if (m_frameCount == 1)
+        {
+            m_averageDuration = deltaTime;
+        }
+        else
+        {
+            m_averageDuration = m_averageDuration * (1 - sg_fpsAlpha) + deltaTime * sg_fpsAlpha;
+        }
+
+        m_fps = static_cast<int>(1.f / m_averageDuration);
+    }
+
+    void tickOneFrame(const float deltaTime)
+    {
+        calculateFPS(deltaTime);
+        glfwSetWindowTitle(window, std::string("Waku - " + std::to_string(m_fps) + " FPS").c_str());  // 设置fps
+        glfwPollEvents();  // 事件循环处理
+        m_camera.update(deltaTime);
+        drawFrame();  // rendering
+    }
+
     void mainLoop() {
-        while (!glfwWindowShouldClose(window)) {
-            glfwPollEvents();  // 事件循环处理
-            drawFrame();  // rendering
+        while (!glfwWindowShouldClose(window)){
+            const float deltaTime = calculateDeltaTime();
+            tickOneFrame(deltaTime);
         }
 
         vkDeviceWaitIdle(device);  // rendering：mainloop退出时因为drawFrame中操作是异步的原因可能draw和present依然在进行，需要等待逻辑设备完成操作后才清理资源
@@ -1566,9 +1666,9 @@ private:
 
         UniformBufferObject ubo{};
         ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));  // 使用时间来旋转而不是帧数，每秒转90度
-        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));  // 从上方45度往下看
-        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float) swapChainExtent.height, 0.1f, 10.0f);  // fov是45度，然后长宽比用当前swap chain，然后设置近平面远平面
-        ubo.proj[1][1] *= -1;  // glm是为opengl设计，其中裁剪空间的Y是倒置的，补偿方法是把投影矩阵的y轴缩放翻转
+
+        ubo.view = m_camera.view();
+        ubo.proj = m_camera.project();
 
         memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     }
